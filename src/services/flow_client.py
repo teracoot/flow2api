@@ -938,12 +938,17 @@ class FlowClient:
         """构造当前上游真实抓包风格的视频提交头。"""
         return self._build_current_flow_media_headers(content_type="text/plain;charset=UTF-8")
 
-    def _resolve_runtime_impersonate(self, fallback: str = "chrome124") -> str:
+    def _resolve_runtime_impersonate(self, fallback: str = "chrome146") -> str:
         resolved = self._resolve_impersonate_from_fingerprint(fallback=fallback)
         return resolved or fallback
 
-    def _resolve_impersonate_from_fingerprint(self, fallback: str = "chrome124") -> str:
-        """根据当前请求链路绑定的浏览器指纹，选择最接近的 curl_cffi impersonate。"""
+    def _resolve_impersonate_from_fingerprint(self, fallback: str = "chrome146") -> str:
+        """Pick curl_cffi impersonate closest to the personal-browser UA.
+
+        Personal Chromium is modern (currently ~149). Falling back to chrome124
+        (or legacy default chrome) creates a TLS/UA mismatch that Google reCAPTCHA
+        V3 often classifies as UNUSUAL_ACTIVITY / TOO_MUCH_TRAFFIC.
+        """
         fingerprint = self.get_request_fingerprint()
         if not isinstance(fingerprint, dict):
             return fallback
@@ -954,9 +959,9 @@ class FlowClient:
             return fallback
 
         if "android" in ua_lower:
-            return "chrome_android"
+            return "chrome131_android"
         if "edg/" in ua_lower or " edge/" in ua_lower:
-            return "edge"
+            return "edge101"
         if "safari/" in ua_lower and "chrome/" not in ua_lower and "chromium/" not in ua_lower:
             if "iphone" in ua_lower or "ipad" in ua_lower or "ios" in ua_lower:
                 return "safari_ios"
@@ -968,14 +973,18 @@ class FlowClient:
         import re
         match = re.search(r"(?:chrome|chromium)/(\d+)", ua_lower)
         if not match:
-            return "chrome"
+            return "chrome146"
 
         major = int(match.group(1))
-        supported = [99, 100, 101, 104, 107, 110, 116, 119, 120, 123, 124]
+        # curl_cffi 0.15.0 desktop Chrome impersonate majors
+        supported = [99, 100, 101, 104, 107, 110, 116, 119, 120, 123, 124, 131, 136, 142, 145, 146]
         if major in supported:
             return f"chrome{major}"
+        if major == 133:
+            return "chrome133a"
+        # Newer than library max (e.g. 149) -> use newest supported, not legacy default
         if major > max(supported):
-            return "chrome"
+            return f"chrome{max(supported)}"
         lower_or_equal = [v for v in supported if v <= major]
         if lower_or_equal:
             return f"chrome{max(lower_or_equal)}"
@@ -1530,11 +1539,10 @@ class FlowClient:
                         )
                         await asyncio.sleep(1)
                         continue
-                    raise RuntimeError(
-                        "Project-scoped image upload failed via /flow/uploadImage; "
-                        "legacy :uploadUserImage fallback is disabled because it may attach media "
-                        f"to a different project (project_id={normalized_project_id})."
-                    ) from new_upload_error
+                    debug_logger.log_warning(
+                        f"[UPLOAD] Project-scoped /flow/uploadImage failed after retries; "
+                        f"falling back to legacy :uploadUserImage (project_id={normalized_project_id}): {new_upload_error}"
+                    )
 
                 debug_logger.log_warning(
                     f"[UPLOAD] New upload API failed, fallback to legacy endpoint: {new_upload_error}"

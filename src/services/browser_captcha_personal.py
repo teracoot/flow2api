@@ -2798,6 +2798,25 @@ class BrowserCaptchaService:
             normalized_user_agent = normalized_user_agent.replace("HeadlessChrome/", "Chrome/")
         if normalized_product:
             normalized_product = normalized_product.replace("HeadlessChrome/", "Chrome/")
+        # Align browser-facing UA with the newest curl_cffi Chrome impersonate (chrome146).
+        # Chromium-for-Testing currently reports Chrome/149, which has no matching TLS
+        # fingerprint in curl_cffi and causes reCAPTCHA UNUSUAL_ACTIVITY evaluation failures.
+        target_major = "146"
+        target_full = "146.0.0.0"
+        if normalized_user_agent:
+            normalized_user_agent = re.sub(
+                r"(Chrome|Chromium)/\d+(?:\.\d+){0,3}",
+                rf"\1/{target_full}",
+                normalized_user_agent,
+                count=1,
+            )
+        if normalized_product:
+            normalized_product = re.sub(
+                r"(Chrome|Chromium)/\d+(?:\.\d+){0,3}",
+                rf"\1/{target_full}",
+                normalized_product,
+                count=1,
+            )
         return normalized_user_agent, normalized_product
 
     def _get_runtime_surface_profile(self) -> Dict[str, Any]:
