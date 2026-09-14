@@ -783,9 +783,15 @@ class TokenManager:
                 record_token_refresh("st", "success")
                 return new_st
             elif new_st == token.st:
-                debug_logger.log_warning(f"[ST_REFRESH] Token {token_id}: 获取到的 ST 与原 ST 相同，可能登录已失效")
-                record_token_refresh("st", "failure")
-                return None
+                # The browser renewal path validates the Labs session and its
+                # future AT expiry before returning. Google may occasionally
+                # reuse the same ST value while issuing a fresh AT, so the
+                # cookie string itself is not a reliable change signal.
+                debug_logger.log_info(
+                    f"[ST_REFRESH] Token {token_id}: Labs会话已续期，ST字符串未变化"
+                )
+                record_token_refresh("st", "success")
+                return new_st
             else:
                 debug_logger.log_warning(f"[ST_REFRESH] Token {token_id}: 无法获取新 ST")
                 record_token_refresh("st", "failure")
