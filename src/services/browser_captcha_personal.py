@@ -12104,6 +12104,18 @@ class BrowserCaptchaService:
                         ) * 1000
                     )
 
+                    current_tab_url = str(getattr(tab, "url", "") or "")
+                    if (
+                        not session_needs_renewal
+                        and not current_tab_url.startswith(PERSONAL_LABS_FLOW_URL)
+                    ):
+                        await self._tab_get(
+                            tab,
+                            PERSONAL_LABS_FLOW_URL,
+                            label=f"refresh_session_restore_flow:{slot_id}",
+                            timeout_seconds=self._navigation_timeout_seconds,
+                        )
+
                     expected_email = ""
                     if token_id and self.db is not None and hasattr(self.db, "get_token"):
                         try:
