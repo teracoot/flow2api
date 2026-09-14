@@ -1029,9 +1029,17 @@ def _compose_proxy_url(
     username: Optional[str] = None,
     password: Optional[str] = None,
 ) -> Optional[str]:
-    """Compose a proxy URL from parsed proxy parts."""
+    """Compose an HTTP-client proxy URL matching Chromium's DNS behavior.
+
+    Chromium's socks5 proxy resolves destination names remotely. libcurl uses
+    local DNS for socks5, so browser fingerprints and asset downloads must use
+    socks5h to preserve the same routing behavior.
+    """
     if not protocol or not host or not port:
         return None
+
+    if protocol == "socks5":
+        protocol = "socks5h"
 
     auth = ""
     if username and password:
@@ -9495,7 +9503,7 @@ class BrowserCaptchaService:
                             )
                         else:
                             proxy_server_arg = f"--proxy-server={protocol}://{host}:{port}"
-                        self._proxy_url = f"{protocol}://{host}:{port}"
+                        self._proxy_url = _compose_proxy_url(protocol, host, port)
                         debug_logger.log_info(f"[BrowserCaptcha] Personal 浏览器代理: {self._proxy_url}")
 
                     browser_args = _build_personal_browser_args(
