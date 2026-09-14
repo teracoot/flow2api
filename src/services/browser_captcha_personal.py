@@ -57,6 +57,13 @@ def resolve_effective_personal_max_resident_tabs(value) -> int:
 
 PERSONAL_COOKIE_PREBIND_URL = "about:blank"
 PERSONAL_LABS_BOOTSTRAP_URL = "https://labs.google/fx/api/auth/providers"
+PERSONAL_LABS_FLOW_URL = "https://labs.google/fx/tools/flow"
+PERSONAL_LABS_AUTH_SIGNOUT_URL = "https://labs.google/fx/api/auth/signout"
+PERSONAL_LABS_AUTH_SIGNIN_URL = "https://labs.google/fx/api/auth/signin"
+PERSONAL_LABS_AUTH_SESSION_URL = "https://labs.google/fx/api/auth/session"
+PERSONAL_SESSION_COOKIE_NAME = "__Secure-next-auth.session-token"
+PERSONAL_SESSION_RENEWAL_LEAD_SECONDS = 3600
+PERSONAL_SESSION_RENEWAL_TIMEOUT_SECONDS = 120
 PERSONAL_COOKIE_TARGET_URLS = (
     "https://labs.google/",
     "https://www.google.com/",
@@ -2712,6 +2719,188 @@ class BrowserCaptchaService:
             timeout_seconds or self._navigation_timeout_seconds,
             label,
         )
+
+    async def _get_labs_session_state(self, tab, label: str) -> Dict[str, Any]:
+        """Read the current Labs session without exposing token values in logs."""
+        current_url = str(getattr(tab, "url", "") or "")
+        if current_url.startswith("https://accounts.google.com/"):
+            return {
+                "authenticated": False,
+                "error": "Google OAuth交互尚未完成",
+            }
+        if not current_url.startswith("https://labs.google/"):
+            await self._tab_get(
+                tab,
+                PERSONAL_LABS_AUTH_SESSION_URL,
+                label=f"{label}:labs_origin",
+                timeout_seconds=self._navigation_timeout_seconds,
+            )
+        script = """
+            (async () => {
+                try {
+                    const response = await fetch(%s, {
+                        method: "GET",
+                        credentials: "include",
+                        cache: "no-store",
+                        headers: {"Accept": "application/json"},
+                    });
+                    const data = await response.json();
+                    const expiresAt = data && data.expires ? Date.parse(data.expires) : NaN;
+                    return {
+                        http_status: response.status,
+                        email: data && data.user ? String(data.user.email || "") : "",
+                        error: data && data.error ? String(data.error) : "",
+                        expires: data && data.expires ? String(data.expires) : "",
+                        expires_at: Number.isFinite(expiresAt) ? expiresAt : null,
+                        authenticated: Boolean(
+                            response.ok && data && data.user && data.access_token &&
+                            !data.error && Number.isFinite(expiresAt)
+                        ),
+                    };
+                } catch (error) {
+                    return {
+                        http_status: 0,
+                        authenticated: false,
+                        error: String(error && error.message || "无法读取Labs会话"),
+                    };
+                }
+            })()
+        """ % json.dumps(PERSONAL_LABS_AUTH_SESSION_URL)
+        result = await self._tab_evaluate(
+            tab,
+            script,
+            label=label,
+            timeout_seconds=self._command_timeout_seconds,
+            await_promise=True,
+            return_by_value=True,
+        )
+        return result if isinstance(result, dict) else {
+            "authenticated": False,
+            "error": "无法读取Labs会话",
+        }
+
+    async def _get_session_cookie_from_context(self, browser_context_id: Any, label: str) -> Optional[str]:
+        """Read and reassemble the NextAuth session cookie, including chunks."""
+        cookies = await self._get_browser_cookies(
+            label=label,
+            browser_context_id=browser_context_id,
+        )
+        session_cookies = []
+        for cookie in cookies:
+            cookie_name = str(getattr(cookie, "name", "") or "")
+            if cookie_name == PERSONAL_SESSION_COOKIE_NAME:
+                session_cookies.append((-1, str(getattr(cookie, "value", "") or "")))
+            elif re.fullmatch(rf"{re.escape(PERSONAL_SESSION_COOKIE_NAME)}\.\d+", cookie_name):
+                session_cookies.append((int(cookie_name.rsplit(".", 1)[1]), str(getattr(cookie, "value", "") or "")))
+        if not session_cookies:
+            return None
+        session_cookies.sort(key=lambda item: item[0])
+        return "".join(value for _index, value in session_cookies) or None
+
+    async def _submit_labs_auth_form(self, tab, form_type: str, label: str) -> None:
+        """Submit the normal NextAuth form and let the browser manage OAuth cookies."""
+        selector = (
+            'form[action*="/api/auth/signout"]'
+            if form_type == "signout"
+            else 'form[action*="/api/auth/signin/google"]'
+        )
+        script = """
+            (() => {
+                const form = document.querySelector(%s);
+                if (!form) {
+                    return {submitted: false, error: "认证表单不存在"};
+                }
+                const csrf = form.querySelector('input[name="csrfToken"]');
+                if (!csrf || !csrf.value) {
+                    return {submitted: false, error: "认证表单缺少CSRF令牌"};
+                }
+                HTMLFormElement.prototype.submit.call(form);
+                return {submitted: true};
+            })()
+        """ % json.dumps(selector)
+        result = await self._tab_evaluate(
+            tab,
+            script,
+            label=label,
+            timeout_seconds=self._command_timeout_seconds,
+            return_by_value=True,
+        )
+        if not isinstance(result, dict) or not result.get("submitted"):
+            raise RuntimeError(str((result or {}).get("error") or "认证表单提交失败"))
+
+    async def _renew_labs_session(
+        self,
+        tab,
+        browser_context_id: Any,
+        expected_email: str = "",
+        label: str = "session_renewal",
+    ) -> Optional[str]:
+        """Renew a stale Labs session through the existing browser profile."""
+        previous_session = await self._get_session_cookie_from_context(
+            browser_context_id,
+            label=f"{label}:old_cookie",
+        )
+
+        await self._tab_get(
+            tab,
+            PERSONAL_LABS_AUTH_SIGNOUT_URL,
+            label=f"{label}:signout_page",
+            timeout_seconds=self._navigation_timeout_seconds,
+        )
+        await self._submit_labs_auth_form(tab, "signout", f"{label}:submit_signout")
+
+        signout_deadline = time.time() + 20
+        while time.time() < signout_deadline:
+            current_cookie = await self._get_session_cookie_from_context(
+                browser_context_id,
+                label=f"{label}:wait_signout",
+            )
+            if not current_cookie:
+                break
+            await asyncio.sleep(0.5)
+        else:
+            raise RuntimeError("Labs登出超时，未能清除旧会话")
+
+        await self._tab_get(
+            tab,
+            PERSONAL_LABS_AUTH_SIGNIN_URL,
+            label=f"{label}:signin_page",
+            timeout_seconds=self._navigation_timeout_seconds,
+        )
+        await self._submit_labs_auth_form(tab, "signin", f"{label}:submit_signin")
+
+        renewal_deadline = time.time() + PERSONAL_SESSION_RENEWAL_TIMEOUT_SECONDS
+        while time.time() < renewal_deadline:
+            current_cookie = await self._get_session_cookie_from_context(
+                browser_context_id,
+                label=f"{label}:wait_cookie",
+            )
+            if current_cookie:
+                state = await self._get_labs_session_state(tab, f"{label}:session_state")
+                expires_at = state.get("expires_at")
+                if (
+                    state.get("authenticated")
+                    and expires_at
+                    and float(expires_at) > (time.time() + PERSONAL_SESSION_RENEWAL_LEAD_SECONDS) * 1000
+                ):
+                    actual_email = str(state.get("email") or "")
+                    if expected_email and actual_email and actual_email.lower() != expected_email.lower():
+                        raise RuntimeError(
+                            f"自动续期登录到了{actual_email}，与原账号{expected_email}不一致"
+                        )
+                        debug_logger.log_info(
+                            f"[BrowserCaptcha] Labs Session Token 自动续期成功 (email={actual_email or '<unknown>'})"
+                        )
+                        await self._tab_get(
+                            tab,
+                            PERSONAL_LABS_FLOW_URL,
+                            label=f"{label}:restore_flow_page",
+                            timeout_seconds=self._navigation_timeout_seconds,
+                        )
+                        return current_cookie
+            await asyncio.sleep(1)
+
+        raise RuntimeError("Labs会话自动续期超时，Google可能需要账号选择或交互式验证")
 
     async def _browser_get(
         self,
@@ -11893,7 +12082,53 @@ class BrowserCaptchaService:
 
             try:
                 async with resident_info.solve_lock:
-                    # 刷新页面以获取最新的 cookies
+                    # Validate the Labs session first. A plain reload does not
+                    # renew the short-lived AT after Google reports
+                    # ACCESS_TOKEN_REFRESH_NEEDED, so run the normal browser
+                    # sign-out/sign-in flow when renewal is required.
+                    session_state = await self._get_labs_session_state(
+                        tab,
+                        label=f"refresh_session_state:{slot_id}",
+                    )
+                    session_cookie = await self._get_session_cookie_from_context(
+                        resident_info.browser_context_id,
+                        label=f"refresh_session_existing_cookie:{slot_id}",
+                    )
+                    session_expires_at = session_state.get("expires_at")
+                    session_needs_renewal = (
+                        not session_cookie
+                        or not session_state.get("authenticated")
+                        or not session_expires_at
+                        or float(session_expires_at) <= (
+                            time.time() + PERSONAL_SESSION_RENEWAL_LEAD_SECONDS
+                        ) * 1000
+                    )
+
+                    expected_email = ""
+                    if token_id and self.db is not None and hasattr(self.db, "get_token"):
+                        try:
+                            bound_token = await self.db.get_token(token_id)
+                            expected_email = str(getattr(bound_token, "email", "") or "")
+                        except Exception:
+                            expected_email = ""
+
+                    if session_needs_renewal:
+                        session_token = await self._renew_labs_session(
+                            tab,
+                            resident_info.browser_context_id,
+                            expected_email=expected_email,
+                            label=f"refresh_session_renew:{slot_id}",
+                        )
+                        if session_token:
+                            resident_info.last_used_at = time.time()
+                            self._remember_project_affinity(project_id, slot_id, resident_info)
+                            self._remember_token_affinity(token_id, slot_id, resident_info)
+                            self._resident_error_streaks.pop(slot_id, None)
+                            self._mark_browser_health(True)
+                            return session_token
+
+                    # Refresh the page to obtain the latest cookies when the
+                    # current Labs session is still healthy.
                     debug_logger.log_info(f"[BrowserCaptcha] 刷新常驻标签页以获取最新 cookies...")
                     resident_info.recaptcha_ready = False
                     await self._run_with_timeout(

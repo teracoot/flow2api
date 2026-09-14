@@ -9,6 +9,7 @@ import base64
 import gzip
 import ssl
 import re
+from datetime import datetime, timezone
 from typing import Dict, Any, Optional, List, Union, Callable, Awaitable
 from urllib.parse import quote, urljoin, urlparse
 import urllib.error
@@ -1194,6 +1195,36 @@ class FlowClient:
 
     # ========== 认证相关 (使用ST) ==========
 
+    @staticmethod
+    def _validate_session_response(result: Any) -> Dict[str, Any]:
+        """Validate the Labs ST->AT response before it reaches token storage."""
+        if not isinstance(result, dict):
+            raise RuntimeError("Google session endpoint returned an invalid response")
+
+        upstream_error = str(result.get("error") or "").strip()
+        if upstream_error:
+            raise RuntimeError(f"Google session access-token refresh required: {upstream_error}")
+
+        access_token = str(result.get("access_token") or "").strip()
+        if not access_token:
+            raise RuntimeError("Google session response did not contain an access token")
+
+        expires_value = str(result.get("expires") or "").strip()
+        if not expires_value:
+            raise RuntimeError("Google session response did not contain an access-token expiry")
+
+        try:
+            expires_at = datetime.fromisoformat(expires_value.replace("Z", "+00:00"))
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("Google session response contained an invalid access-token expiry") from exc
+
+        if expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=timezone.utc)
+        if expires_at <= datetime.now(timezone.utc):
+            raise RuntimeError("Google session response contained an expired access token")
+
+        return result
+
     async def st_to_at(self, st: str) -> dict:
         """ST转AT
 
@@ -1209,13 +1240,14 @@ class FlowClient:
         """
         url = f"{self.labs_base_url}/auth/session"
         try:
-            return await self._make_request(
+            result = await self._make_request(
                 method="GET",
                 url=url,
                 use_st=True,
                 st_token=st,
                 timeout=self._get_control_plane_timeout(),
             )
+            return self._validate_session_response(result)
         except Exception as e:
             if not self._is_proxy_connection_error(e):
                 raise
@@ -1223,7 +1255,7 @@ class FlowClient:
             debug_logger.log_warning(
                 f"[AUTH] ST->AT failed via configured proxy, retrying direct connection: {e}"
             )
-            return await self._make_request(
+            result = await self._make_request(
                 method="GET",
                 url=url,
                 use_st=True,
@@ -1231,6 +1263,7 @@ class FlowClient:
                 timeout=self._get_control_plane_timeout(),
                 force_no_proxy=True,
             )
+            return self._validate_session_response(result)
 
     # ========== 项目管理 (使用ST) ==========
 
@@ -4917,5 +4950,3 @@ class FlowClient:
         except Exception as e:
             debug_logger.log_error(f"[reCAPTCHA {method}] error: {str(e)}")
             return None
-
-
